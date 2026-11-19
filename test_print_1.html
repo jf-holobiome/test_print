@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Label Print Test</title>
+<style>
+    :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --ok: #1a7f37; --bad: #c62828; --accent: #0b5cad; }
+    @media (prefers-color-scheme: dark) {
+        :root { --bg: #161618; --fg: #f2f2f2; --muted: #a1a1a6; --line: #3a3a3c; --ok: #4ac26b; --bad: #ff6b6b; --accent: #5aa7ff; }
+    }
+    body { background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; margin: 0; padding: 16px; }
+    main { max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 15px; margin: 24px 0 8px; }
+    p.note { color: var(--muted); margin: 0 0 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+    input, select, button, textarea { font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+    button { cursor: pointer; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    textarea { width: 100%; box-sizing: border-box; height: 180px; font-family: ui-monospace, monospace; font-size: 12px; }
+    #status { margin-top: 12px; white-space: pre-wrap; }
+    .ok { color: var(--ok); } .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+    <h1>Label print test</h1>
+    <p class="note">Uses Zebra Browser Print on this computer. No Crossmapper or ELN calls.</p>
+
+    <div class="row">
+        <button id="check">1. Check printer</button>
+        <button id="preview">2. Preview ZPL</button>
+        <button id="print" class="primary">3. Print</button>
+    </div>
+    <div id="status"></div>
+
+    <h2>Test batch</h2>
+    <table>
+        <thead><tr><th>Tube barcode</th><th>HD</th><th>Type</th><th>QR (ELN ID)</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+
+    <h2>Add a tube (scan into the box)</h2>
+    <div class="row">
+        <input id="scanTube" placeholder="Scan tube barcode, Enter" size="24">
+        <select id="newType"></select>
+        <label><input type="checkbox" id="newQr" checked> QR</label>
+    </div>
+
+    <h2>Verify printed labels (scan each QR)</h2>
+    <div class="row">
+        <input id="scanQr" placeholder="Scan label QR, Enter" size="24">
+    </div>
+    <div id="verify"></div>
+
+    <h2>ZPL</h2>
+    <textarea id="zpl" readonly></textarea>
+</main>
+
+<script>
+// 1" x 0.5" label at 203 dpi
+const LABEL = { widthDots: 203, heightDots: 102 };
+// Zebra Browser Print's local service on this computer (not the printer's IP)
+const BROWSER_PRINT = "http://127.0.0.1:9100";
+
+const SAMPLE_TYPES = {
+    mitra: { labelText: "Blood" },
+    dna: { labelText: "DNA" },
+    metabolomics: { labelText: "Metabolomics" }
+};
+
+const samples = [
+    { barcode: "2183210737", hd_number: "HD999", component_type: "mitra", elnSampleID: 42542585 },
+    { barcode: "23260100601121", hd_number: "HD999", component_type: "dna", elnSampleID: 28800002 },
+    { barcode: "276145006047", hd_number: "HD999", component_type: "metabolomics", elnSampleID: 28800003 },
+    { barcode: "NOBARCODE-1", hd_number: "HD999", component_type: "mitra", elnSampleID: null }
+];
+let fakeId = 28800010;
+
+
+// ---------- label code (same as the intake script) ----------
+
+function elabBarcode(sampleID) {
+    return "005" + String(sampleID).padStart(12, "0");
+}
+
+function localToday() {
+    return new Date().toLocaleDateString("en-CA");
+}
+
+function zplText(text) {
+    return String(text ?? "").replace(/[\^~]/g, " ");
+}
+
+function buildLabelZpl({ hdNumber, date, tubeType, barcode }) {
+    const typeSize = barcode && String(tubeType).length > 7 ? 16 : 24;
+    const lines = [
+        "^XA",
+        "^CI28",
+        `^PW${LABEL.widthDots}`,
+        `^LL${LABEL.heightDots}`,
+        `^FO10,10^A0N,30,30^FD${zplText(hdNumber)}^FS`,
+        `^FO10,46^A0N,20,20^FD${zplText(date)}^FS`,
+        `^FO10,70^A0N,${typeSize},${typeSize}^FD${zplText(tubeType)}^FS`
+    ];
+    if (barcode) {
+        lines.push(`^FO128,4^BQN,2,3^FDQA,${barcode}^FS`);
+    }
+    lines.push("^XZ");
+    return lines.join("\n");
+}
+
+function buildLabelsZpl(list, sampleTypes, date = localToday()) {
+    return list.map((sample) => buildLabelZpl({
+        hdNumber: sample.hd_number,
+        date,
+        tubeType: sampleTypes[sample.component_type].labelText,
+        barcode: sample.elnSampleID ? elabBarcode(sample.elnSampleID) : null
+    })).join("\n");
+}
+
+// Browser Print can wrap the device differently by version: unwrap to the
+// object that has a "name"
+function unwrapDevice(value) {
+    if (!value) {
+        return null;
+    }
+    if (Array.isArray(value)) {
+        return unwrapDevice(value[0]);
+    }
+    if (value.name) {
+        return value;
+    }
+    return unwrapDevice(value.printer ?? value.device ?? value.deviceList);
+}
+
+async function getBrowserPrintJson(path) {
+    let response;
+    try {
+        response = await fetch(`${BROWSER_PRINT}${path}`);
+    } catch {
+        throw new Error("Zebra Browser Print is not running on this computer (or blocked this page)");
+    }
+    const text = await response.text();
+    console.log(`Browser Print ${path}:`, text);
+    return response.ok && text ? JSON.parse(text) : null;
+}
+
+async function getDefaultPrinter() {
+    // the default printer first, else the first printer Browser Print can see
+    const device = unwrapDevice(await getBrowserPrintJson("/default?type=printer"))
+        ?? unwrapDevice(await getBrowserPrintJson("/available"));
+    if (!device) {
+        throw new Error("Browser Print returned no printer with a name (see Console, F12)");
+    }
+    return device;
+}
+
+async function printZplUsb(zpl) {
+    const device = await getDefaultPrinter();
+    const printResponse = await fetch(`${BROWSER_PRINT}/write`, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: JSON.stringify({ device, data: zpl })
+    });
+    if (!printResponse.ok) {
+        throw new Error(`Print failed (${printResponse.status}): ${await printResponse.text()}`);
+    }
+}
+
+
+// ---------- page ----------
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(text, kind = "") {
+    $("status").className = kind;
+    $("status").textContent = text;
+}
+
+function render() {
+    $("rows").innerHTML = "";
+    samples.forEach((s, i) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${s.barcode}</td><td>${s.hd_number}</td><td>${s.component_type}</td>`
+            + `<td>${s.elnSampleID ? elabBarcode(s.elnSampleID) : "none"}</td>`
+            + `<td><button data-i="${i}">Remove</button></td>`;
+        $("rows").appendChild(tr);
+    });
+    $("zpl").value = buildLabelsZpl(samples, SAMPLE_TYPES);
+}
+
+Object.keys(SAMPLE_TYPES).forEach((name) => {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    $("newType").appendChild(option);
+});
+
+$("rows").addEventListener("click", (event) => {
+    if (event.target.dataset.i !== undefined) {
+        samples.splice(Number(event.target.dataset.i), 1);
+        render();
+    }
+});
+
+$("scanTube").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") {
+        return;
+    }
+    const barcode = $("scanTube").value.trim();
+    $("scanTube").value = "";
+    if (!barcode) {
+        return;
+    }
+    samples.push({
+        barcode,
+        hd_number: "HD999",
+        component_type: $("newType").value,
+        elnSampleID: $("newQr").checked ? fakeId++ : null
+    });
+    render();
+});
+
+$("scanQr").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") {
+        return;
+    }
+    const scanned = $("scanQr").value.trim();
+    $("scanQr").value = "";
+    if (!scanned) {
+        return;
+    }
+    const match = samples.find((s) => s.elnSampleID && elabBarcode(s.elnSampleID) === scanned);
+    const line = document.createElement("div");
+    line.className = match ? "ok" : "bad";
+    line.textContent = match
+        ? `OK  ${scanned}  →  tube ${match.barcode}`
+        : `NO MATCH  "${scanned}" is not one of this batch's QR codes`;
+    $("verify").prepend(line);
+});
+
+$("check").addEventListener("click", async () => {
+    setStatus("Checking…");
+    try {
+        const device = await getDefaultPrinter();
+        setStatus(`Printer found: ${device.name ?? JSON.stringify(device)}`, "ok");
+    } catch (error) {
+        setStatus(error.message, "bad");
+    }
+});
+
+$("preview").addEventListener("click", () => {
+    $("zpl").value = buildLabelsZpl(samples, SAMPLE_TYPES);
+    $("zpl").select();
+    setStatus("ZPL selected below. Copy it into labelary.com/viewer.html (8 dpmm, 1 x 0.5 in) to see the labels.");
+});
+
+$("print").addEventListener("click", async () => {
+    if (!samples.length) {
+        setStatus("No labels in the batch.", "bad");
+        return;
+    }
+    setStatus("Printing…");
+    try {
+        await printZplUsb(buildLabelsZpl(samples, SAMPLE_TYPES));
+        setStatus(`Sent ${samples.length} labels to the printer. Scan each QR below to verify.`, "ok");
+        $("scanQr").focus();
+    } catch (error) {
+        setStatus(error.message, "bad");
+    }
+});
+
+render();
+</script>
+</body>
+</html>
